@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-job-code-sample
+  namespace: default
+data:
+  data_loader.py: |
+    import ray
+    from qdrant_client import QdrantClient
+    from sentence_transformers import SentenceTransformer
+    from typing import Dict, List
+    import os
+
+    @ray.remote
+    class QdrantIngester:
+        def __init__(self):
+            self.qdrant_client = QdrantClient(
+                "qdrant",
+                port=6333
+            )
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+        def create_collection(self):
+            try:
+                self.qdrant_client.recreate_collection(
+                    collection_name="knowledge_base",
+                    vectors_config={
+                        "size": 384,
+                        "distance": "Cosine"
+                    }
+                )
+                print("Collection created successfully")
+            except Exception as e:
+                print(f"Error creating collection: {e}")
+
+        def process_batch(self, batch: List[Dict]) -> int:
+            try:
+                vectors = []
+                for item in batch:
+                    embedding = self.embedding_model.encode(item["text"])
+                    vector = {
+                        "id": abs(hash(item["text"])),
+                        "vector": embedding.tolist(),
+                        "payload": item
+                    }
+                    vectors.append(vector)
+
+                self.qdrant_client.upsert(
+                    collection_name="knowledge_base",
+                    points=vectors
+                )
+                print(f"Processed batch of {len(vectors)} items")
+                return len(vectors)
+            except Exception as e:
+                print(f"Error processing batch: {e}")
+                return 0
+
+    def load_data():
+        return [
+            {
+                "text": "Quantum computing uses quantum phenomena to perform calculations.",
+                "category": "science",
+                "source": "example"
+            },
+            {
+                "text": "Machine learning is a subset of AI focused on data-driven learning.",
+                "category": "technology",
+                "source": "example"
+            }
+        ]
+
+    def main():
+        print("Initializing Ray...")
+        ray.init()
+        
+        print("Loading data...")
+        data = load_data()
+        print(f"Loaded {len(data)} items")
+        
+        print("Creating QdrantIngester...")
+        ingester = QdrantIngester.remote()
+        
+        print("Creating collection...")
+        ray.get(ingester.create_collection.remote())
+        
+        batch_size = 100
+        batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
+        
+        print(f"Processing {len(batches)} batches...")
+        futures = [ingester.process_batch.remote(batch) for batch in batches]
+        results = ray.get(futures)
+        
+        total_processed = sum(results)
+        print(f"Total records processed: {total_processed}")
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: qdrant-loader-job
+  namespace: default
+spec:
+  entrypoint: python /home/ray/samples/data_loader.py
+  shutdownAfterJobFinishes: false
+  rayClusterSpec:
+    rayVersion: '2.43.0'
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        num-cpus: '1'
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: public.ecr.aws/j5k9c6o6/rag:latest
+              env:
+                - name: PYTHONPATH
+                  value: "/home/ray/samples"
+              volumeMounts:
+                - mountPath: /home/ray/samples
+                  name: code-sample
+              resources:
+                limits:
+                  cpu: "8"
+                  memory: "32Gi"
+                requests:
+                  cpu: "8"
+                  memory: "32Gi"
+          volumes:
+            - name: code-sample
+              configMap:
+                name: ray-job-code-sample
+          nodeSelector:
+            NodeGroupType: x86-cpu-karpenter
+            type: karpenter
+    workerGroupSpecs:
+    - groupName: cpu-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams: {}
+        # num-cpus: '1'  # Added the required rayStartParams
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: public.ecr.aws/j5k9c6o6/rag:latest
+            env:
+              - name: PYTHONPATH
+                value: "/home/ray/samples"
+            volumeMounts:
+              - mountPath: /home/ray/samples
+                name: code-sample
+            resources:
+              limits:
+                cpu: "6"
+                memory: "28Gi"
+                nvidia.com/gpu: "1"
+              requests:
+                cpu: "6"
+                memory: "28Gi"
+                nvidia.com/gpu: "1"
+          volumes:
+            - name: code-sample
+              configMap:
+                name: ray-job-code-sample
+          nodeSelector:
+              NodeGroupType: g5-gpu-karpenter
+              type: karpenter
+          tolerations:
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
