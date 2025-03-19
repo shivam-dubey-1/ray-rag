@@ -13,9 +13,8 @@ helm install qdrant qdrant/qdrant
 
    port forward kubectl port-forward svc/qdrant 6333:6333 and riun this on other tab
 
-curl -X POST http://localhost:6333/collections/knowledge_base/points/scroll \
->   -H 'Content-Type: application/json' \
->   -d '{"limit": 10, "with_payload": true, "with_vector": false}'
+curl -X POST http://localhost:6333/collections/knowledge_base/points/scroll -H 'Content-Type: application/json' -d '{"limit": 10, "with_payload": true, "with_vector": false}'
+
 {"result":{"points":[{"id":298834018309226939,"payload":{"text":"Quantum computing uses quantum phenomena to perform calculations.","category":"science","source":"example"}},{"id":7643334340263966969,"payload":{"text":"Machine learning is a subset of AI focused on data-driven learning.","category":"technology","source":"example"}}],"next_page_offset":null},"status":"ok","time":0.000324771}
 
 After serve.yaml and configmap
