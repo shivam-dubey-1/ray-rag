@@ -11,6 +11,8 @@ helm install qdrant qdrant/qdrant
 
 4. After job ran successfully you can  test if the data got loaded into vector db
 
+   port forward kubectl port-forward svc/qdrant 6333:6333 and riun this on other tab
+
 curl -X POST http://localhost:6333/collections/knowledge_base/points/scroll \
 >   -H 'Content-Type: application/json' \
 >   -d '{"limit": 10, "with_payload": true, "with_vector": false}'
