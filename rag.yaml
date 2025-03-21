@@ -1,0 +1,557 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streamlined-rag-api
+data:
+  streamlined_rag.py: |
+    import os
+    import logging
+    from typing import AsyncGenerator, List, Dict, Any, Optional
+    import json
+    
+    from fastapi import FastAPI, BackgroundTasks
+    from starlette.requests import Request
+    from starlette.responses import StreamingResponse, Response, JSONResponse
+    
+    from ray import serve
+    
+    # Initialize FastAPI app
+    app = FastAPI()
+    logger = logging.getLogger("ray.serve")
+    
+    @serve.deployment(name="streamlined-rag",
+        ray_actor_options={"num_gpus": 1}
+    )
+    @serve.ingress(app)
+    class StreamlinedRAG:
+        def __init__(
+            self,
+            model: str = None,
+            tensor_parallel_size: int = 1,
+            max_num_seqs: int = 32,
+            block_size: int = 4096,
+            max_model_len: int = 8192,
+        ):
+            logger.info("StreamlinedRAG is initializing...")
+            
+            try:
+                # Import dependencies in a specific order to manage CUDA properly
+                
+                # First, let's handle the vector embedding and retrieval part
+                from qdrant_client import QdrantClient
+                from sentence_transformers import SentenceTransformer
+                
+                self.qdrant_host = os.getenv("QDRANT_HOST", "qdrant.default.svc.cluster.local")
+                self.qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
+                self.collection_name = os.getenv("QDRANT_COLLECTION", "knowledge_base")
+                
+                logger.info(f"Connecting to Qdrant at {self.qdrant_host}:{self.qdrant_port}, collection: {self.collection_name}")
+                self.qdrant_client = QdrantClient(host=self.qdrant_host, port=self.qdrant_port)
+                
+                # Initialize embedding model
+                embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+                logger.info(f"Loading embedding model: {embedding_model}")
+                self.encoder = SentenceTransformer(embedding_model)
+                logger.info("Successfully loaded embedding model")
+                
+                # Test embedding model
+                test_vector = self.encoder.encode("test query")
+                logger.info(f"Test encoding successful, vector dimension: {len(test_vector)}")
+                
+                # Now let's import and initialize the vLLM parts
+                import torch
+                if not torch.cuda.is_available():
+                    logger.error("CUDA is not available. This will cause issues with vLLM.")
+                    logger.error(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
+                else:
+                    logger.info(f"CUDA is available. Detected GPUs: {torch.cuda.device_count()}")
+                
+                from vllm.engine.arg_utils import AsyncEngineArgs
+                from vllm.engine.async_llm_engine import AsyncLLMEngine
+                from vllm.sampling_params import SamplingParams
+                from vllm.utils import random_uuid
+                from huggingface_hub import login
+                
+                # Save classes as instance attributes for use in other methods
+                self.SamplingParams = SamplingParams
+                self.random_uuid = random_uuid
+                
+                # Login to Hugging Face
+                hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")
+                if hf_token:
+                    login(token=hf_token)
+                    logger.info("Successfully logged in to Hugging Face Hub")
+                
+                # Get model ID from environment or use default
+                self.model_name = os.getenv("MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.3")
+                
+                # Initialize vLLM engine
+                logger.info("Initializing vLLM engine...")
+                engine_args = AsyncEngineArgs(
+                    model=self.model_name,
+                    tensor_parallel_size=tensor_parallel_size,
+                    max_num_seqs=max_num_seqs,
+                    block_size=block_size,
+                    max_model_len=max_model_len,
+                    disable_log_requests=True,
+                    device="cuda",
+                    dtype="bfloat16",
+                    trust_remote_code=True,
+                    gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.85")),
+                    max_num_batched_tokens=int(os.getenv("MAX_NUM_BATCHED_TOKENS", "32768")),
+                )
+                
+                self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+                logger.info("vLLM engine initialized successfully")
+                
+                logger.info("StreamlinedRAG initialization complete")
+                
+            except Exception as e:
+                logger.error(f"Error during initialization: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+        
+        async def stream_results(self, results_generator) -> AsyncGenerator[bytes, None]:
+            num_returned = 0
+            async for request_output in results_generator:
+                text_outputs = [output.text for output in request_output.outputs]
+                assert len(text_outputs) == 1
+                text_output = text_outputs[0][num_returned:]
+                ret = {"text": text_output}
+                yield (json.dumps(ret) + "\n").encode("utf-8")
+                num_returned += len(text_output)
+
+        async def may_abort_request(self, request_id) -> None:
+            await self.engine.abort(request_id)
+        
+        # --- ENDPOINT 1: Get data directly from vector database ---
+        
+        @app.post("/retrieve")
+        async def retrieve_only(self, request: Request):
+            """Retrieve relevant documents from vector DB without LLM processing"""
+            try:
+                request_dict = await request.json()
+                logger.info(f"Received retrieve request: {request_dict}")
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"error": "Invalid JSON in request body"})
+
+            query = request_dict.get("query", "")
+            if not query:
+                return JSONResponse(status_code=400, content={"error": "Query is required"})
+                
+            top_k = request_dict.get("top_k", 3)
+            
+            try:
+                # Encode the query
+                query_vector = self.encoder.encode(query).tolist()
+                
+                # Search in Qdrant
+                search_results = self.qdrant_client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_vector,
+                    limit=top_k,
+                )
+                
+                # Extract and format the contexts
+                results = []
+                for result in search_results:
+                    payload = result.payload
+                    text = payload.get("text", "")
+                    source = payload.get("source", "Unknown")
+                    score = result.score
+                    results.append({
+                        "text": text,
+                        "source": source,
+                        "score": score
+                    })
+                
+                logger.info(f"Retrieved {len(results)} results for query: {query}")
+                
+                return JSONResponse(content={
+                    "query": query,
+                    "results": results
+                })
+            except Exception as e:
+                logger.error(f"Error in vector search: {str(e)}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Vector search error: {str(e)}"}
+                )
+        
+        # --- ENDPOINT 2: Get response directly from model ---
+        
+        @app.post("/generate")
+        async def generate_only(self, request: Request):
+            """Generate response directly from LLM without vector DB"""
+            try:
+                request_dict = await request.json()
+                logger.info(f"Received generate request: {request_dict}")
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"error": "Invalid JSON in request body"})
+
+            query = request_dict.get("query", "")
+            if not query:
+                return JSONResponse(status_code=400, content={"error": "Query is required"})
+                
+            # Format the prompt
+            system_prompt = request_dict.get("system_prompt", "You are a helpful assistant.")
+            prompt = f"""
+            {system_prompt}
+            
+            User: {query}
+            
+            Assistant:"""
+            
+            # Prepare sampling parameters
+            sampling_params = self.SamplingParams(
+                max_tokens=request_dict.get("max_tokens", 1024),
+                temperature=request_dict.get("temperature", 0.7),
+                top_p=request_dict.get("top_p", 0.9),
+                top_k=request_dict.get("top_k", 50),
+                stop=request_dict.get("stop", None),
+            )
+
+            request_id = self.random_uuid()
+            logger.info(f"Processing generate request {request_id}")
+
+            try:
+                # Generate the response using vLLM engine
+                results_generator = self.engine.generate(prompt, sampling_params, request_id)
+
+                stream = request_dict.get("stream", False)
+                if stream:
+                    background_tasks = BackgroundTasks()
+                    background_tasks.add_task(self.may_abort_request, request_id)
+                    return StreamingResponse(
+                        self.stream_results(results_generator), background=background_tasks
+                    )
+
+                # Non-streaming case
+                final_output = None
+                async for request_output in results_generator:
+                    if await request.is_disconnected():
+                        await self.engine.abort(request_id)
+                        logger.warning(f"Client disconnected for request {request_id}")
+                        return Response(status_code=499)
+                    final_output = request_output
+
+                assert final_output is not None
+                text_outputs = [output.text for output in final_output.outputs]
+                
+                # Fix common output issues
+                result_text = text_outputs[0]
+                # Remove excessive hyphens (more than 10 in a row)
+                import re
+                result_text = re.sub(r'-{10,}', '----------', result_text)
+                
+                ret = {
+                    "model": self.model_name,
+                    "answer": result_text.strip(),
+                    "query": query
+                }
+                logger.info(f"Completed generate request {request_id}")
+                return JSONResponse(content=ret)
+            
+            except Exception as e:
+                logger.error(f"Error in LLM generation: {str(e)}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"LLM generation error: {str(e)}"}
+                )
+        
+        # --- ENDPOINT 3: RAG-enhanced response ---
+        
+        @app.post("/rag")
+        async def rag_enhanced(self, request: Request):
+            """Generate response with RAG enhancement"""
+            try:
+                request_dict = await request.json()
+                logger.info(f"Received RAG request: {request_dict}")
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"error": "Invalid JSON in request body"})
+
+            query = request_dict.get("query", "")
+            if not query:
+                return JSONResponse(status_code=400, content={"error": "Query is required"})
+                
+            top_k = request_dict.get("top_k", 3)
+            
+            try:
+                # Encode the query
+                query_vector = self.encoder.encode(query).tolist()
+                
+                # Search in Qdrant
+                search_results = self.qdrant_client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_vector,
+                    limit=top_k,
+                )
+                
+                # Extract and format the contexts
+                contexts = []
+                context_details = []
+                for result in search_results:
+                    payload = result.payload
+                    text = payload.get("text", "")
+                    source = payload.get("source", "Unknown")
+                    score = result.score
+                    contexts.append(f"Source: {source}\n{text}")
+                    context_details.append({
+                        "text": text,
+                        "source": source,
+                        "score": score
+                    })
+                
+                context_text = "\n\n".join(contexts)
+                logger.info(f"Retrieved context of length {len(context_text)} for query: {query}")
+                
+                # Format the prompt with retrieved context
+                system_prompt = request_dict.get("system_prompt", "You are a helpful assistant that answers based on the provided context.")
+                rag_prompt = f"""
+                {system_prompt}
+                
+                Context:
+                {context_text}
+                
+                User Question: {query}
+                
+                Please provide a helpful answer based on the context provided. If the context doesn't contain relevant information, say so and provide a general response.
+                
+                Assistant:"""
+                
+                # Prepare sampling parameters
+                sampling_params = self.SamplingParams(
+                    max_tokens=request_dict.get("max_tokens", 1024),
+                    temperature=request_dict.get("temperature", 0.7),
+                    top_p=request_dict.get("top_p", 0.9),
+                    top_k=request_dict.get("top_k", 50),
+                    stop=request_dict.get("stop", None),
+                )
+
+                request_id = self.random_uuid()
+                logger.info(f"Processing RAG request {request_id}")
+
+                # Generate the response using vLLM engine
+                results_generator = self.engine.generate(rag_prompt, sampling_params, request_id)
+
+                stream = request_dict.get("stream", False)
+                if stream:
+                    background_tasks = BackgroundTasks()
+                    background_tasks.add_task(self.may_abort_request, request_id)
+                    return StreamingResponse(
+                        self.stream_results(results_generator), background=background_tasks
+                    )
+
+                # Non-streaming case
+                final_output = None
+                async for request_output in results_generator:
+                    if await request.is_disconnected():
+                        await self.engine.abort(request_id)
+                        logger.warning(f"Client disconnected for request {request_id}")
+                        return Response(status_code=499)
+                    final_output = request_output
+
+                assert final_output is not None
+                text_outputs = [output.text for output in final_output.outputs]
+                
+                # Fix common output issues
+                result_text = text_outputs[0]
+                # Remove excessive hyphens (more than 10 in a row)
+                import re
+                result_text = re.sub(r'-{10,}', '----------', result_text)
+                
+                # Control how much context detail to include
+                include_context = request_dict.get("include_context", False)
+                
+                ret = {
+                    "model": self.model_name,
+                    "answer": result_text.strip(),
+                    "query": query,
+                    "used_context": len(contexts) > 0,
+                    "context_count": len(contexts)
+                }
+                
+                if include_context:
+                    ret["contexts"] = context_details
+                
+                logger.info(f"Completed RAG request {request_id}")
+                return JSONResponse(content=ret)
+            
+            except Exception as e:
+                logger.error(f"Error in RAG process: {str(e)}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"RAG error: {str(e)}"}
+                )
+        
+        @app.get("/")
+        async def root(self):
+            """Return API information"""
+            return JSONResponse(content={
+                "name": "Streamlined RAG API",
+                "description": "API with three focused endpoints for vector search and LLM generation",
+                "endpoints": [
+                    {"path": "/retrieve", "method": "POST", "description": "Get data directly from vector DB"},
+                    {"path": "/generate", "method": "POST", "description": "Get response directly from model"},
+                    {"path": "/rag", "method": "POST", "description": "Get RAG-enhanced response"}
+                ],
+                "version": "1.0"
+            })
+    
+    # Export the deployment
+    deployment = StreamlinedRAG.bind()
+---
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: streamlined-rag
+spec:
+  serviceUnhealthySecondThreshold: 3600
+  deploymentUnhealthySecondThreshold: 3600
+  serveConfigV2: |
+    applications:
+      - name: api
+        import_path: streamlined_rag:deployment
+        route_prefix: "/"
+        runtime_env:
+          pip:
+            - "qdrant-client==1.13.3"
+            - "sentence-transformers==3.4.1"
+          env_vars:
+            PYTHONPATH: "/home/ray/python"
+            LD_LIBRARY_PATH: "/home/ray/anaconda3/lib:$LD_LIBRARY_PATH"
+            MODEL_ID: "mistralai/Mistral-7B-Instruct-v0.3"
+            GPU_MEMORY_UTILIZATION: "0.85"
+            MAX_MODEL_LEN: "8192"
+            MAX_NUM_SEQ: "4"
+            MAX_NUM_BATCHED_TOKENS: "32768"
+            QDRANT_HOST: "qdrant.default.svc.cluster.local"
+            QDRANT_PORT: "6333"
+            QDRANT_COLLECTION: "knowledge_base"
+  rayClusterConfig:
+    rayVersion: '2.43.0'
+    enableInTreeAutoscaling: true
+    headGroupSpec:
+      serviceType: LoadBalancer
+      headService:
+        metadata:
+          name: streamlined-rag
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        num-cpus: "0"
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: public.ecr.aws/j5k9c6o6/eks-genai-workshop:latest
+            imagePullPolicy: IfNotPresent
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sh", "-c", "ray stop"]
+            ports:
+            - containerPort: 6379
+              name: gcs
+            - containerPort: 8265
+              name: dashboard
+            - containerPort: 10001
+              name: client
+            - containerPort: 8000
+              name: serve
+            - containerPort: 52365
+              name: dashboard-agent
+            volumeMounts:
+            - mountPath: /tmp/ray
+              name: ray-logs
+            - name: streamlined-rag-script
+              mountPath: /home/ray/python/streamlined_rag.py
+              subPath: streamlined_rag.py
+            resources:
+              limits:
+                cpu: 2
+                memory: "12G"
+              requests:
+                cpu: 2
+                memory: "12G"
+            env:
+            - name: PYTHONPATH
+              value: "/home/ray/python"
+            - name: LD_LIBRARY_PATH
+              value: "/home/ray/anaconda3/lib:$LD_LIBRARY_PATH"
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: hf-token
+          nodeSelector:
+            NodeGroupType: x86-cpu-karpenter
+            type: karpenter
+          volumes:
+          - name: ray-logs
+            emptyDir: {}
+          - name: streamlined-rag-script
+            configMap:
+              name: streamlined-rag-api
+    workerGroupSpecs:
+    - replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      groupName: gpu-group
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: public.ecr.aws/j5k9c6o6/eks-genai-workshop:latest
+            imagePullPolicy: IfNotPresent
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sh", "-c", "ray stop"]
+            volumeMounts:
+            - mountPath: /tmp/ray
+              name: ray-logs
+            - name: streamlined-rag-script
+              mountPath: /home/ray/python/streamlined_rag.py
+              subPath: streamlined_rag.py
+            resources:
+              limits:
+                cpu: 6
+                memory: "28Gi"  
+                nvidia.com/gpu: 1
+              requests:
+                cpu: 6
+                memory: "28Gi"  
+                nvidia.com/gpu: 1
+            env:
+            - name: PYTHONPATH
+              value: "/home/ray/python"
+            - name: LD_LIBRARY_PATH
+              value: "/home/ray/anaconda3/lib:$LD_LIBRARY_PATH"
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: hf-token
+          volumes:
+          - name: ray-logs
+            emptyDir: {}
+          - name: streamlined-rag-script
+            configMap:
+              name: streamlined-rag-api
+          nodeSelector:
+            NodeGroupType: g5-gpu-karpenter
+            type: karpenter
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
+            
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+stringData:
+  hf-token: token_required
