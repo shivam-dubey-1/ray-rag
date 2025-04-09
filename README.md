@@ -23,3 +23,13 @@ This configuration will now:
 
 Initialize both the vLLM engine and the Qdrant client.
 For each incoming request, it will: a. Query the Qdrant vector database for relevant context. b. Enhance the user's prompt with this context. c. Pass the enhanced prompt to the language model. d. Return the generated response.
+
+
+
+irsa for s3 eksctl create iamserviceaccount \
+  --name s3-access-sa \
+  --namespace default \
+  --cluster gpu-workshop \
+  --region us-west-2 \
+  --attach-policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess \
+  --approve
