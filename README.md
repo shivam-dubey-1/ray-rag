@@ -33,3 +33,7 @@ irsa for s3 eksctl create iamserviceaccount \
   --region us-west-2 \
   --attach-policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess \
   --approve
+
+
+  ## If you are running s3-job.yaml , make sure you create irsa with valid trustrelationship and iam policy
+  
