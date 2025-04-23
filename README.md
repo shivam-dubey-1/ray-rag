@@ -36,4 +36,76 @@ irsa for s3 eksctl create iamserviceaccount \
 
 
   ## If you are running s3-job.yaml , make sure you create irsa with valid trustrelationship and iam policy
-  
+
+export CLUSTER_NAME=your-cluster-name
+export OIDC_URL=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text | sed 's/https:\/\///')
+
+# Create policy file
+cat <<EOF > s3-policy.json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::rag-sample-data-test",
+                "arn:aws:s3:::rag-sample-data-test/*"
+            ]
+        }
+    ]
+}
+EOF
+
+# Create the IAM policy
+aws iam create-policy \
+    --policy-name ray-s3-access-policy \
+    --policy-document file://s3-policy.json
+
+cat <<EOF > s3-policy.json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::rag-sample-data-test",
+                "arn:aws:s3:::rag-sample-data-test/*"
+            ]
+        }
+    ]
+}
+EOF
+
+
+cat <<EOF > trust-relationship.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):oidc-provider/${OIDC_URL}"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "${OIDC_URL}:sub": "system:serviceaccount:default:ray-service-account",
+          "${OIDC_URL}:aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+
+aws iam create-role \
+    --role-name ray-s3-access-role \
+    --assume-role-policy-document file://trust-relationship.json
+
